@@ -1,0 +1,238 @@
+/**
+    @file gam_m2.cpp
+
+    @brief Gamma module
+            method2: lut version, one slap two pixel
+**/
+
+#include "gam_m2.hpp"
+
+namespace gam_m2 {
+
+Gam_m2::Gam_m2(const PicsInfo& pics_info, const RoundEnable rnd_en) : Strategy(pics_info, rnd_en) {}
+
+void Gam_m2::getConf(picojson::value& conf_json) {
+    conf.enable             = json::getVal(conf_json, "enable").get<double>();
+    conf.mode               = json::getVal(conf_json, "mode").get<double>();
+    conf.dither_enable      = json::getVal(conf_json, "dither_enable").get<double>();
+    conf.dither_seed_enable = json::getVal(conf_json, "dither_seed_enable").get<double>();
+    conf.dither_seed_odd    = json::getArrayInt(conf_json, "dither_seed_odd");
+    conf.dither_seed_even   = json::getArrayInt(conf_json, "dither_seed_even");
+    conf.dither_pmask_odd   = json::getArrayInt(conf_json, "dither_pmask_odd");
+    conf.dither_pmask_even  = json::getArrayInt(conf_json, "dither_pmask_even");
+    conf.lut                = json::getArrayDouble(conf_json, "lut");
+    conf.offset_in          = json::getVal(conf_json, "offset_in").get<double>();
+    conf.offset_out         = json::getVal(conf_json, "offset_out").get<double>();
+
+    checkArraySize(conf.dither_seed_odd, 2);
+    checkArraySize(conf.dither_seed_even, 2);
+    checkArraySize(conf.dither_pmask_odd, 2);
+    checkArraySize(conf.dither_pmask_even, 2);
+    checkArraySize(conf.lut, 65);
+
+    // write constraints(assert) here
+
+    return;
+}
+
+void Gam_m2::setConf(picojson::value& conf_json) {
+    intClip(conf.enable, acc_u(1), rnd_en);
+    intClip(conf.mode, acc_u(1), rnd_en);
+    intClip(conf.dither_enable, acc_u(1), rnd_en);
+    intClip(conf.dither_seed_enable, acc_u(1), rnd_en);
+    intClip(conf.dither_seed_odd, acc_u(16), rnd_en);
+    intClip(conf.dither_seed_even, acc_u(16), rnd_en);
+    intClip(conf.dither_pmask_odd, acc_u(16), rnd_en);
+    intClip(conf.dither_pmask_even, acc_u(16), rnd_en);
+    fpClipRound(conf.lut, acc_u(8, 6), rnd_en, HALF_UP);
+    fpClipRound(conf.offset_in, acc_pic.in[0][0], rnd_en, HALF_UP);
+    fpClipRound(conf.offset_out, acc_pic.out[0][0], rnd_en, HALF_UP);
+
+    json::setVal(conf_json, "enable", static_cast<double>(conf.enable));
+    json::setVal(conf_json, "mode", static_cast<double>(conf.mode));
+    json::setVal(conf_json, "dither_enable", static_cast<double>(conf.dither_enable));
+    json::setVal(conf_json, "dither_seed_enable", static_cast<double>(conf.dither_seed_enable));
+    json::setArray(conf_json, "dither_seed_odd", conf.dither_seed_odd);
+    json::setArray(conf_json, "dither_seed_even", conf.dither_seed_even);
+    json::setArray(conf_json, "dither_pmask_odd", conf.dither_pmask_odd);
+    json::setArray(conf_json, "dither_pmask_even", conf.dither_pmask_even);
+    json::setArray(conf_json, "lut", conf.lut);
+    json::setVal(conf_json, "offset_in", conf.offset_in);
+    json::setVal(conf_json, "offset_out", conf.offset_out);
+
+    return;
+}
+
+void Gam_m2::getStat(picojson::value& stat_json) {
+    stat.dither_lfsr_odd  = json::getArrayInt(stat_json, "dither_lfsr_odd");
+    stat.dither_lfsr_even = json::getArrayInt(stat_json, "dither_lfsr_even");
+
+    checkArraySize(stat.dither_lfsr_odd, 2);
+    checkArraySize(stat.dither_lfsr_even, 2);
+
+    return;
+}
+
+void Gam_m2::setStat(picojson::value& stat_json) {
+    intClip(stat.dither_lfsr_odd, acc_u(16), rnd_en);
+    intClip(stat.dither_lfsr_even, acc_u(16), rnd_en);
+
+    json::setArray(stat_json, "dither_lfsr_odd", stat.dither_lfsr_odd);
+    json::setArray(stat_json, "dither_lfsr_even", stat.dither_lfsr_even);
+
+    return;
+}
+
+void Gam_m2::setAccPic() {
+    for (auto&& pic_info : pics_info.in) {
+        acc_pic.in.push_back(convAccPic(OFFBIN2SIGNED, pic_info.picture_type, pic_info.acc, pic_info.bias));
+    }
+    for (auto&& pic_info : pics_info.out) {
+        acc_pic.out.push_back(convAccPic(OFFBIN2SIGNED, pic_info.picture_type, pic_info.acc, pic_info.bias));
+    }
+    return;
+}
+
+namespace {
+// write subfunctions here
+
+double logLut(double v, vector<double> lut, int gblk_num, const RoundEnable rnd_en) {
+    int    lblk_num = (lut.size() - 1) / gblk_num;
+    double abs_v    = fabs(v);
+    double gamma_v  = 0;
+
+    for (int gblk = 0; gblk < gblk_num; ++gblk) {
+        double gblk_max = 256.0 / pow(2, gblk);
+        double gblk_min = 0.0;
+        if (gblk < gblk_num - 1) {
+            gblk_min = gblk_max / 2;
+        }
+        if (abs_v >= gblk_min) {
+            double lblk_width = (gblk_max - gblk_min) / lblk_num;
+            for (int lblk = 0; lblk < lblk_num; ++lblk) {
+                double lblk_min = gblk_min + lblk_width * (lblk_num - 1 - lblk);
+                if (abs_v >= lblk_min) {
+                    double pos   = (abs_v - lblk_min) / lblk_width;
+                    gamma_v      = lut[lblk_num * (gblk_num - 1 - gblk) + (lblk_num - 1 - lblk)];
+                    double delta = (lut[lblk_num * (gblk_num - 1 - gblk) + (lblk_num - 1 - lblk) + 1] -
+                                    lut[lblk_num * (gblk_num - 1 - gblk) + (lblk_num - 1 - lblk)]) *
+                                   pos;
+                    fpClipRound(delta, acc_u5_6, rnd_en, HALF_UP);
+                    gamma_v = gamma_v + delta;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    if (v < 0) {
+        gamma_v *= -1.0;
+    }
+    return gamma_v;
+}
+
+}  // namespace
+
+void Gam_m2::run(vector<Picture>& pics, picojson::value& stat_json) {
+    runPre(pics);
+    for (size_t i = 0; i < pics_info.in.size(); ++i) {
+        pics[i].convOffBin(OFFBIN2SIGNED, pics_info.in[i].bias);
+        pics[i].setRndAcc(rnd_en, pics_info.in[i].rnd_type, acc_pic.in[i]);
+        pics[i].fpClipRoundImg();
+    }
+
+    if (!conf.enable) {
+        // write algo for bypass here if necessary
+    } else {
+        // write algo here
+        acc_t acc_m;
+        acc_m.bits     = acc_pic.out[0][0].bits + 0 + 1 - acc_pic.out[0][0].sign;
+        acc_m.int_bits = acc_pic.out[0][0].int_bits;
+        acc_m.sign     = 1;
+
+        Picture& pic = pics[0];
+        for (int y = 0; y < pic.h(); ++y) {
+            for (int x = 0; x < pic.w(); ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    pic(c, y, x) -= conf.offset_in;
+                }
+            }
+        }
+        if (conf.mode == 0) {
+            for (int y = 0; y < pic.h(); ++y) {
+                for (int x = 0; x < pic.w(); ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        pic(c, y, x) = logLut(pic(c, y, x), conf.lut, 1, rnd_en);
+                    }
+                }
+            }
+        } else if (conf.mode == 1) {
+            for (int y = 0; y < pic.h(); ++y) {
+                for (int x = 0; x < pic.w(); ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        pic(c, y, x) = logLut(pic(c, y, x), conf.lut, 8, rnd_en);
+                    }
+                }
+            }
+        } else {
+            std::cerr << "[error] " << __FILE__ << "," << __LINE__ << std::endl
+                      << " not supported gamma mode: " << conf.mode << std::endl;
+        }
+
+        if (conf.dither_seed_enable) {
+            stat.dither_lfsr_odd  = conf.dither_seed_odd;
+            stat.dither_lfsr_even = conf.dither_seed_even;
+        }
+        // pMask are picked from
+        // https://git-core.megvii-inc.com/chenjiahui/LFSR/tree/master/pMask 16.txt,15.txt
+        // vector<uint16_t> pMask_array_odd{32991, 20953};
+        // vector<uint16_t> pMask_array_even{33104, 20525};
+        vector<uint16_t> pmask_array_odd;
+        vector<uint16_t> pmask_array_even;
+        pmask_array_odd.assign(begin(conf.dither_pmask_odd), end(conf.dither_pmask_odd));
+        pmask_array_even.assign(begin(conf.dither_pmask_even), end(conf.dither_pmask_even));
+
+        vector<int>   inBitWidth_array{16, 15};
+        constexpr int bits       = 4;
+        constexpr int throughput = 3;
+
+        mc40::Dither dither_odd(conf.dither_enable, bits, throughput, pmask_array_odd, inBitWidth_array);
+        mc40::Dither dither_even(conf.dither_enable, bits, throughput, pmask_array_even, inBitWidth_array);
+
+        for (int y = 0; y < pic.h(); ++y) {
+            for (int x = 0; x < pic.w(); ++x) {
+                vector<double> rand(throughput, 0.5);
+                if (x % 2 == 0) {
+                    vector<uint16_t> dither_lfsr;
+                    dither_lfsr.assign(begin(stat.dither_lfsr_even), end(stat.dither_lfsr_even));
+                    dither_even.generateRand(rand, dither_lfsr);
+                    stat.dither_lfsr_even.assign(begin(dither_lfsr), end(dither_lfsr));
+                } else {
+                    vector<uint16_t> dither_lfsr;
+                    dither_lfsr.assign(begin(stat.dither_lfsr_odd), end(stat.dither_lfsr_odd));
+                    dither_odd.generateRand(rand, dither_lfsr);
+                    stat.dither_lfsr_odd.assign(begin(dither_lfsr), end(dither_lfsr));
+                }
+                for (int c = 0; c < throughput; ++c) {
+                    fpClipRound(pic(c, y, x), acc_m, rnd_en, HALF_UP, rand[c]);
+                    pic(c, y, x) += conf.offset_out;
+                }
+            }
+        }
+    }
+
+    pics.resize(pics_info.out.size());
+    pics.shrink_to_fit();
+    for (size_t i = 0; i < pics_info.out.size(); ++i) {
+        pics[i].setRndAcc(rnd_en, pics_info.out[i].rnd_type, acc_pic.out[i]);
+        pics[i].fpClipRoundImg();
+        pics[i].convOffBin(SIGNED2OFFBIN, pics_info.out[i].bias);
+    }
+    if (conf.enable) {
+        setStat(stat_json);
+    }
+    runPost(pics);
+    return;
+}
+
+}  // namespace gam_m2
